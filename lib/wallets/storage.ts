@@ -4,16 +4,25 @@
 
 const STORAGE_KEY = "tt_wallets_v1";
 
+// Forces a Uint8Array's underlying bytes into a fresh, plain ArrayBuffer.
+// This sidesteps a TS lib conflict where Node's types and the DOM's
+// SubtleCrypto types disagree on whether Uint8Array is backed by
+// ArrayBuffer vs the more general ArrayBufferLike — the code is correct
+// either way, this just satisfies the stricter DOM overload at compile time.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
 async function deriveKey(password: string, salt: Uint8Array) {
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(password),
+    toArrayBuffer(new TextEncoder().encode(password)),
     "PBKDF2",
     false,
     ["deriveKey"]
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 100_000, hash: "SHA-256" },
+    { name: "PBKDF2", salt: toArrayBuffer(salt), iterations: 100_000, hash: "SHA-256" },
     keyMaterial,
     { name: "AES-GCM", length: 256 },
     false,
@@ -26,7 +35,11 @@ export async function saveWalletsEncrypted(wallets: unknown, password: string) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(password, salt);
   const data = new TextEncoder().encode(JSON.stringify(wallets));
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data)
+  );
 
   localStorage.setItem(
     STORAGE_KEY,
@@ -44,9 +57,9 @@ export async function loadWalletsEncrypted(password: string) {
   const { salt, iv, data } = JSON.parse(raw);
   const key = await deriveKey(password, new Uint8Array(salt));
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: new Uint8Array(iv) },
+    { name: "AES-GCM", iv: toArrayBuffer(new Uint8Array(iv)) },
     key,
-    new Uint8Array(data)
+    toArrayBuffer(new Uint8Array(data))
   );
   return JSON.parse(new TextDecoder().decode(plaintext));
 }

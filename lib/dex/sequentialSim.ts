@@ -73,7 +73,7 @@ export async function simulateSequentialLoadPlan(
   const tickDataProvider = new TickListDataProvider(
     [
       { index: TickMath.MIN_TICK, liquidityNet: JSBI.BigInt(state.liquidity.toString()), liquidityGross: JSBI.BigInt(state.liquidity.toString()) },
-      { index: TickMath.MAX_TICK, liquidityNet: JSBI.BigInt(state.liquidity.toString()) * JSBI.BigInt(-1), liquidityGross: JSBI.BigInt(state.liquidity.toString()) },
+      { index: TickMath.MAX_TICK, liquidityNet: JSBI.multiply(JSBI.BigInt(state.liquidity.toString()), JSBI.BigInt(-1)), liquidityGross: JSBI.BigInt(state.liquidity.toString()) },
     ],
     state.tickSpacing
   );
