@@ -9,7 +9,8 @@ export interface SendResult {
 }
 
 // Distribute ETH from one funded signer to many recipient addresses.
-// Works whether the signer is the MetaMask main wallet or a local Wallet object.
+// Sends are fired with sequential nonces without waiting for each to confirm,
+// then all receipts are awaited together at the end.
 export async function distributeEth(
   signer: JsonRpcSigner | Wallet,
   recipients: string[],
@@ -17,59 +18,49 @@ export async function distributeEth(
   onProgress?: (result: SendResult) => void
 ): Promise<SendResult[]> {
   const amount = parseEther(amountEachEth);
-  const results: SendResult[] = [];
-
-  for (const to of recipients) {
-    try {
-      const tx = await signer.sendTransaction({ to, value: amount });
-      const receipt = await tx.wait();
-      const result: SendResult = { address: to, status: "success", txHash: receipt?.hash };
-      results.push(result);
-      onProgress?.(result);
-    } catch (err: any) {
-      const result: SendResult = { address: to, status: "failed", error: err.message };
-      results.push(result);
-      onProgress?.(result);
-    }
-  }
-  return results;
+  const items = recipients.map((address) => ({ address, amountWei: amount }));
+  return distributeVariableEth(signer, items, onProgress);
 }
 
 // Sweep ETH balance (minus gas buffer) from many local wallets back to one address.
+// These originate from different keys, so they have no nonce dependency on each
+// other and can be sent fully in parallel.
 export async function collectEth(
   wallets: Wallet[],
   destination: string,
   onProgress?: (result: SendResult) => void
 ): Promise<SendResult[]> {
-  const results: SendResult[] = [];
-
-  for (const wallet of wallets) {
-    try {
+  const outcomes = await Promise.allSettled(
+    wallets.map(async (wallet) => {
       const provider = wallet.provider!;
-      const balance = await provider.getBalance(wallet.address);
-      const feeData = await provider.getFeeData();
+      const [balance, feeData] = await Promise.all([
+        provider.getBalance(wallet.address),
+        provider.getFeeData(),
+      ]);
       const gasLimit = 21_000n;
       const gasCost = (feeData.gasPrice ?? 0n) * gasLimit;
       const sendAmount = balance - gasCost;
 
       if (sendAmount <= 0n) {
-        const result: SendResult = { address: wallet.address, status: "failed", error: "Insufficient balance to cover gas" };
-        results.push(result);
-        onProgress?.(result);
-        continue;
+        throw new Error("Insufficient balance to cover gas");
       }
 
       const tx = await wallet.sendTransaction({ to: destination, value: sendAmount, gasLimit });
       const receipt = await tx.wait();
-      const result: SendResult = { address: wallet.address, status: "success", txHash: receipt?.hash };
-      results.push(result);
-      onProgress?.(result);
-    } catch (err: any) {
-      const result: SendResult = { address: wallet.address, status: "failed", error: err.message };
-      results.push(result);
-      onProgress?.(result);
-    }
-  }
+      return { address: wallet.address, status: "success" as const, txHash: receipt?.hash };
+    })
+  );
+
+  const results: SendResult[] = outcomes.map((outcome, i) => {
+    const address = wallets[i].address;
+    const result: SendResult =
+      outcome.status === "fulfilled"
+        ? outcome.value
+        : { address, status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+    onProgress?.(result);
+    return result;
+  });
+
   return results;
 }
 
@@ -84,21 +75,37 @@ export async function distributeToken(
   onProgress?: (result: SendResult) => void
 ): Promise<SendResult[]> {
   const token = new Contract(tokenAddress, ERC20_ABI, signer);
-  const results: SendResult[] = [];
+  const startNonce = await signer.getNonce("pending");
 
-  for (const to of recipients) {
-    try {
-      const tx = await token.transfer(to, amountEachWei);
-      const receipt = await tx.wait();
-      const result: SendResult = { address: to, status: "success", txHash: receipt.hash };
-      results.push(result);
-      onProgress?.(result);
-    } catch (err: any) {
-      const result: SendResult = { address: to, status: "failed", error: err.message };
-      results.push(result);
+  const sendOutcomes = await Promise.allSettled(
+    recipients.map((to, i) => token.transfer(to, amountEachWei, { nonce: startNonce + i }))
+  );
+
+  const results: SendResult[] = [];
+  const pendingWaits: { i: number; tx: any }[] = [];
+
+  sendOutcomes.forEach((outcome, i) => {
+    if (outcome.status === "fulfilled") {
+      pendingWaits.push({ i, tx: outcome.value });
+    } else {
+      const result: SendResult = { address: recipients[i], status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+      results[i] = result;
       onProgress?.(result);
     }
-  }
+  });
+
+  const waitOutcomes = await Promise.allSettled(pendingWaits.map(({ tx }) => tx.wait()));
+
+  waitOutcomes.forEach((outcome, idx) => {
+    const { i } = pendingWaits[idx];
+    const result: SendResult =
+      outcome.status === "fulfilled"
+        ? { address: recipients[i], status: "success", txHash: outcome.value.hash }
+        : { address: recipients[i], status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+    results[i] = result;
+    onProgress?.(result);
+  });
+
   return results;
 }
 
@@ -107,25 +114,47 @@ export interface VariableSendItem {
   amountWei: bigint;
 }
 
+// Sends all funding transactions with manually sequenced nonces so they don't
+// wait on each other's confirmations, then awaits all receipts together.
+// Because these share one signer (e.g. MetaMask), each send still requires
+// individual wallet approval — but approvals no longer block on mining time.
 export async function distributeVariableEth(
   signer: JsonRpcSigner | Wallet,
   items: VariableSendItem[],
   onProgress?: (result: SendResult) => void
 ): Promise<SendResult[]> {
-  const results: SendResult[] = [];
+  const startNonce = await signer.getNonce("pending");
 
-  for (const { address, amountWei } of items) {
-    try {
-      const tx = await signer.sendTransaction({ to: address, value: amountWei });
-      const receipt = await tx.wait();
-      const result: SendResult = { address, status: "success", txHash: receipt?.hash };
-      results.push(result);
-      onProgress?.(result);
-    } catch (err: any) {
-      const result: SendResult = { address, status: "failed", error: err.message };
-      results.push(result);
+  const sendOutcomes = await Promise.allSettled(
+    items.map(({ address, amountWei }, i) =>
+      signer.sendTransaction({ to: address, value: amountWei, nonce: startNonce + i })
+    )
+  );
+
+  const results: SendResult[] = new Array(items.length);
+  const pendingWaits: { i: number; tx: any }[] = [];
+
+  sendOutcomes.forEach((outcome, i) => {
+    if (outcome.status === "fulfilled") {
+      pendingWaits.push({ i, tx: outcome.value });
+    } else {
+      const result: SendResult = { address: items[i].address, status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+      results[i] = result;
       onProgress?.(result);
     }
-  }
+  });
+
+  const waitOutcomes = await Promise.allSettled(pendingWaits.map(({ tx }) => tx.wait()));
+
+  waitOutcomes.forEach((outcome, idx) => {
+    const { i } = pendingWaits[idx];
+    const result: SendResult =
+      outcome.status === "fulfilled"
+        ? { address: items[i].address, status: "success", txHash: outcome.value?.hash }
+        : { address: items[i].address, status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+    results[i] = result;
+    onProgress?.(result);
+  });
+
   return results;
 }

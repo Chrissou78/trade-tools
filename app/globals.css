@@ -1,39 +1,89 @@
+/* app/globals.css */
 @import "tailwindcss";
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
+@theme {
+  --color-brand: #E6C200;
+  --color-brand-gold: #FFD700;
+  --color-brand-goldLight: #FFF2CC;
+  --color-brand-goldMuted: #C5A44D;
+  --color-brand-goldDark: #8B7355;
+  --color-surface-1: #080808;
+  --color-surface-2: #0f0f10;
+  --font-display: var(--font-space-grotesk), sans-serif;
+}
+
+html, body {
+  width: 100%;
+  min-height: 100%;
 }
 
 html {
   scroll-behavior: smooth;
+  font-size: 17px;
 }
+
+:root { color-scheme: dark; background-color: #080808; }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+  font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: #080808;
+  background-image:
+    radial-gradient(circle at 15% 0%, rgba(230, 194, 0, 0.08), transparent 40%),
+    radial-gradient(circle at 85% 100%, rgba(102, 0, 204, 0.06), transparent 40%);
   min-height: 100vh;
-  color: #e2e8f0;
+  color: #FFF2CC;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-code {
-  font-family: 'Fira Code', monospace;
+code, .font-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+.font-display { font-family: var(--font-space-grotesk), sans-serif; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); }
+::-webkit-scrollbar-thumb { background: rgba(230, 194, 0, 0.35); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(230, 194, 0, 0.6); }
+
+.glass-card {
+  border-radius: 1.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background-color: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 12px 50px -12px rgba(230, 194, 0, 0.20);
 }
 
-::-webkit-scrollbar {
-  width: 8px;
+.gradient-text {
+  background: linear-gradient(120deg, #E6C200, #FFD700, #FFF2CC);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
-::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.05);
+.gradient-border {
+  background: linear-gradient(135deg, rgba(230, 194, 0, 0.8), rgba(255, 215, 0, 0.5));
+  padding: 1px;
+  border-radius: 1.5rem;
 }
 
-::-webkit-scrollbar-thumb {
-  background: rgba(139, 92, 246, 0.5);
-  border-radius: 4px;
+.shadow-progress-glow {
+  box-shadow: 0 0 8px rgba(230, 194, 0, .6), 0 0 16px rgba(255, 215, 0, .4), 0 0 24px rgba(255, 215, 0, .25);
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(139, 92, 246, 0.8);
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 15px rgba(230, 194, 0, .25), 0 0 30px rgba(255, 215, 0, .15); }
+  50% { box-shadow: 0 0 25px rgba(230, 194, 0, .4), 0 0 50px rgba(255, 215, 0, .25); }
 }
+.animate-glow-pulse { animation: glowPulse 4s ease-in-out infinite; }
+
+@keyframes shakeGold {
+  0% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+  100% { transform: translateX(0); }
+}
+.animate-shake { animation: shakeGold .4s ease; }

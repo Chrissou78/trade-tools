@@ -15,8 +15,11 @@ export interface WalletAmount {
   ethAmount: string; // exact amount for this specific wallet, e.g. from planSequentialBuys
 }
 
-// New: takes a precise per-wallet amount array instead of one flat amount.
-// This is what executeEntry should call now, using `plan` directly.
+// Fires all buy transactions concurrently — each wallet has its own key, so
+// there's no nonce coupling and no wallet-approval popups to serialize on.
+// An optional random delay is applied before each send (not after waiting for
+// the previous one) to preserve natural staggering without blocking on
+// confirmation time. Pass delayMsBetween=[0,0] or omit it for true simultaneous sends.
 export async function multiBuyVariable(
   items: WalletAmount[],
   tokenAddress: string,
@@ -24,30 +27,31 @@ export async function multiBuyVariable(
   delayMsBetween?: [number, number],
   onProgress?: (result: BuyResult) => void
 ): Promise<BuyResult[]> {
-  const results: BuyResult[] = [];
-
-  for (const { wallet, ethAmount } of items) {
-    try {
+  const outcomes = await Promise.allSettled(
+    items.map(async ({ wallet, ethAmount }) => {
+      if (delayMsBetween) {
+        const [min, max] = delayMsBetween;
+        const jitter = min + Math.random() * (max - min);
+        await new Promise((r) => setTimeout(r, jitter));
+      }
       const receipt = await buyNoxaTokenProtected({
         wallet,
         tokenAddress,
         ethAmount,
         slippageBps,
       });
-      const result: BuyResult = { address: wallet.address, status: "success", txHash: receipt?.hash };
-      results.push(result);
-      onProgress?.(result);
-    } catch (err: any) {
-      const result: BuyResult = { address: wallet.address, status: "failed", error: err.message };
-      results.push(result);
-      onProgress?.(result);
-    }
+      return { address: wallet.address, status: "success" as const, txHash: receipt?.hash };
+    })
+  );
 
-    if (delayMsBetween) {
-      const [min, max] = delayMsBetween;
-      await new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
-    }
-  }
+  const results: BuyResult[] = outcomes.map((outcome, i) => {
+    const result: BuyResult =
+      outcome.status === "fulfilled"
+        ? outcome.value
+        : { address: items[i].wallet.address, status: "failed", error: outcome.reason?.message ?? String(outcome.reason) };
+    onProgress?.(result);
+    return result;
+  });
 
   return results;
 }

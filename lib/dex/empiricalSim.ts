@@ -1,59 +1,83 @@
 // lib/dex/empiricalSim.ts
-import { NOXA_ROBINHOOD_CONSTANTS, simulateBuyExact, planSequentialBuys, CurveCalibration, WalletBuyStep, sqrtPToMarketCapUsd } from "./noxaCurve";
+import {
+  NOXA_ROBINHOOD_CONSTANTS,
+  backSolveLiquidityFromSwap,
+  ethNeededForExactTokens,
+  simulateBuyExact,
+  sqrtPToMarketCapUsd,
+} from "./noxaCurve";
 
 const Q96 = 2 ** 96;
+const { floorSqrtPriceX96, feeRate, totalSupply } = NOXA_ROBINHOOD_CONSTANTS;
 
-export interface EmpiricalSimInput {
+// Exact floor sqrtP ("a" convention: sqrt(TOKEN per WETH)), computed directly
+// from the on-chain-verified constant. This is real division on real floats —
+// no manual rounding involved.
+const FLOOR_SQRT_P = Number(floorSqrtPriceX96) / Q96;
+
+// ---- Calibration anchor: one real observed buy from an actual NOXA
+// Robinhood launch (0.04 ETH gross in -> 28,751,714.68 tokens out). ----
+// This single data point is passed through backSolveLiquidityFromSwap —
+// the closed-form inverse of the exact same Uniswap V3 swap formula used
+// everywhere else in this file — to solve for the curve's liquidity
+// constant L. Everything downstream of this is pure algebra on L, the
+// floor price, and the fee rate. No lookup table, no interpolation.
+const CALIBRATION_ETH_GROSS = 0.04;
+const CALIBRATION_TOKENS_REMAINING = 971_248_285.32;
+const CALIBRATION_TOKENS_OUT = totalSupply - CALIBRATION_TOKENS_REMAINING;
+const CALIBRATION_ETH_EFFECTIVE = CALIBRATION_ETH_GROSS * (1 - feeRate);
+
+export const DEFAULT_LIQUIDITY_ESTIMATE = backSolveLiquidityFromSwap(
+  CALIBRATION_ETH_EFFECTIVE,
+  CALIBRATION_TOKENS_OUT,
+  FLOOR_SQRT_P
+);
+
+export interface OwnerBuyStep {
+  walletIndex: number;
+  ethGrossToSend: number;
+  tokensOut: number;
+  mcAfterUsd: number;
+}
+
+export function simulateFromOwnerBuy(params: {
   ownerBuyEth: number;
   walletCount: number;
-  targetPctOfSupplyPerWallet: number; // 0.02 = 2%
-  liquidityL: number;
+  targetPctOfSupplyPerWallet: number;
+  liquidityL?: number;
   ethPriceUsd: number;
-}
+}) {
+  const { ownerBuyEth, walletCount, targetPctOfSupplyPerWallet, ethPriceUsd } = params;
+  const L = params.liquidityL ?? DEFAULT_LIQUIDITY_ESTIMATE;
+  const curve = { liquidity: L, feeRate };
 
-export interface EmpiricalSimResult {
-  floorMcUsd: number;              // MC at pool creation, before anyone buys
-  afterOwnerBuyMcUsd: number;      // MC right after the owner's first buy — your sanity-check number
-  tokensOwnerBought: number;
-  pctOfSupplyOwnerBought: number;  // owner's buy as % of total supply
-  ethReserveAfterOwnerBuy: number; // virtual ETH reserve at that point, for cross-checking
-  tokenReserveAfterOwnerBuy: number;
-  steps: WalletBuyStep[];
-}
+  const floorMcUsd = sqrtPToMarketCapUsd(FLOOR_SQRT_P, totalSupply, ethPriceUsd);
 
-export function simulateFromOwnerBuy(input: EmpiricalSimInput): EmpiricalSimResult {
-  const floorSqrtP = Number(NOXA_ROBINHOOD_CONSTANTS.floorSqrtPriceX96) / Q96;
-  const curve: CurveCalibration = { liquidity: input.liquidityL, feeRate: NOXA_ROBINHOOD_CONSTANTS.feeRate };
+  const { tokensOut: tokensBoughtByOwner, newSqrtP: sqrtPAfterOwnerBuy } =
+    simulateBuyExact(ownerBuyEth, FLOOR_SQRT_P, curve);
 
-  const floorMcUsd = sqrtPToMarketCapUsd(floorSqrtP, NOXA_ROBINHOOD_CONSTANTS.totalSupply, input.ethPriceUsd);
+  const afterOwnerBuyMcUsd = sqrtPToMarketCapUsd(sqrtPAfterOwnerBuy, totalSupply, ethPriceUsd);
+  const pctOfSupplyOwnerBought = (tokensBoughtByOwner / totalSupply) * 100;
+  const ethReserveAfterOwnerBuy = ownerBuyEth;
+  const tokenReserveAfterOwnerBuy = totalSupply - tokensBoughtByOwner;
 
-  const ownerStep = simulateBuyExact(input.ownerBuyEth, floorSqrtP, curve);
-  const afterOwnerBuyMcUsd = sqrtPToMarketCapUsd(ownerStep.newSqrtP, NOXA_ROBINHOOD_CONSTANTS.totalSupply, input.ethPriceUsd);
+  const steps: OwnerBuyStep[] = [];
+  const targetTokensPerWallet = totalSupply * targetPctOfSupplyPerWallet;
+  let sqrtP = sqrtPAfterOwnerBuy;
 
-  // Virtual reserves at the post-owner-buy price — x = L/sqrtP (ETH side), y = L*sqrtP (token side).
-  // Shown so you can eyeball ETH-in-pool / tokens-in-pool directly against the MC figure above.
-  const ethReserveAfterOwnerBuy = input.liquidityL / ownerStep.newSqrtP;
-  const tokenReserveAfterOwnerBuy = input.liquidityL * ownerStep.newSqrtP;
-
-  const targetTokensPerWallet = NOXA_ROBINHOOD_CONSTANTS.totalSupply * input.targetPctOfSupplyPerWallet;
-  const steps = planSequentialBuys(
-    input.walletCount,
-    targetTokensPerWallet,
-    ownerStep.newSqrtP, // wallets buy starting from the price the owner's buy already moved it to
-    curve,
-    NOXA_ROBINHOOD_CONSTANTS.totalSupply,
-    input.ethPriceUsd
-  );
+  for (let w = 0; w < walletCount; w++) {
+    const { ethGrossIn, newSqrtP } = ethNeededForExactTokens(targetTokensPerWallet, sqrtP, curve);
+    sqrtP = newSqrtP;
+    const mcAfterUsd = sqrtPToMarketCapUsd(sqrtP, totalSupply, ethPriceUsd);
+    steps.push({ walletIndex: w, ethGrossToSend: ethGrossIn, tokensOut: targetTokensPerWallet, mcAfterUsd });
+  }
 
   return {
+    steps,
     floorMcUsd,
     afterOwnerBuyMcUsd,
-    tokensOwnerBought: ownerStep.tokensOut,
-    pctOfSupplyOwnerBought: (ownerStep.tokensOut / NOXA_ROBINHOOD_CONSTANTS.totalSupply) * 100,
+    pctOfSupplyOwnerBought,
     ethReserveAfterOwnerBuy,
     tokenReserveAfterOwnerBuy,
-    steps,
   };
 }
-
-export const DEFAULT_LIQUIDITY_ESTIMATE = 2_500_000;
