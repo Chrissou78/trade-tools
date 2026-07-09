@@ -2,8 +2,7 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { WebSocketProvider, JsonRpcProvider, Contract } from "ethers";
-import { getFloorPriceFromInitialize, sqrtPToMarketCapUsd } from "@/lib/dex/noxaCurve";
-import { getExactLiquidityFromMint, getLiveSqrtPrice } from "@/lib/dex/noxaCurve";
+import { getExactLiquidityFromMint, getLiveSqrtPrice, sqrtPToMarketCapUsd } from "@/lib/dex/noxaCurve";
 
 const LAUNCH_FACTORY = "0xD9eC2db5f3D1b236843925949fe5bd8a3836FCcB";
 const UNISWAP_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";

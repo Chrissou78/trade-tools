@@ -1,7 +1,7 @@
-// scanner/runner.ts
+// future/backend-scanner/runner.ts
 import { startNoxaLaunchWatcher } from "./noxaLaunchWatcher";
-import { getFloorPriceFromInitialize } from "../lib/dex/floorPrice";
-import { getExactLiquidityFromMint } from "../lib/dex/noxaCurve";
+import { getFloorPriceFromInitialize } from "../../lib/dex/floorPrice";
+import { getExactLiquidityFromMint } from "../../lib/dex/noxaCurve";
 import { JsonRpcProvider } from "ethers";
 import fs from "fs";
 
