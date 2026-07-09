@@ -2,28 +2,28 @@
 "use client";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { BrowserProvider, JsonRpcProvider, Wallet, parseEther } from "ethers";
-import { Wallet as WalletIcon, LineChart, Rocket, Target, ShieldAlert, Upload, Download } from "lucide-react";
 import { generateWalletSet, GeneratedWallet } from "@/lib/wallets/generator";
 import { downloadWalletsCsv, parseWalletsCsv } from "@/lib/wallets/csv";
 import { findPoolAndState } from "@/lib/dex/pool";
 import { planMultiWalletBuy } from "@/lib/dex/planMultiBuy";
 import { simulateFromOwnerBuy, DEFAULT_LIQUIDITY_ESTIMATE } from "@/lib/dex/empiricalSim";
 import { distributeVariableEth } from "@/lib/batch/sender";
-import { multiBuyVariable, BuyResult } from "@/lib/batch/buyer";
+import { multiBuyVariable } from "@/lib/batch/buyer";
 import { sellNoxaToken } from "@/lib/dex/sell";
 import { getLiveSqrtPrice, sqrtPToMarketCapUsd } from "@/lib/dex/noxaCurve";
 import { useEthPrice } from "@/hooks/useEthPrice";
 import { WalletConnectButton } from "@/components/WalletConnectButton";
 import { topUpShortfalls } from "@/lib/batch/topUp";
-import {
-  PageHeader, StepCard, Field, Input, Button, StatBox, Banner, Toggle, AddressChip, SecretField,
-} from "@/components/ui";
+import { PageHeader, Banner } from "@/components/ui";
+import { WalletsSection } from "./sections/WalletsSection";
+import { SimulateSection } from "./sections/SimulateSection";
+import { FundBuySection } from "./sections/FundBuySection";
+import { SellSection } from "./sections/SellSection";
+import type {
+  StatusMsg, StatusTone, PlanStep, WalletSellConfig, WalletEntry, EmpiricalStats, SimMode,
+} from "./types";
 
 const HTTP_RPC = process.env.NEXT_PUBLIC_ROBINHOOD_HTTP_RPC!;
-
-interface PlanStep { walletIndex: number; ethGrossToSend: number; mcAfterUsd: number }
-interface WalletSellConfig { sellPct: number; gainThreshold: number; autoSell: boolean }
-interface WalletEntry extends BuyResult { entryMcUsd?: number }
 
 export default function LaunchPage() {
   const ethPriceUsd = useEthPrice();
@@ -31,25 +31,25 @@ export default function LaunchPage() {
   const [walletCount, setWalletCount] = useState(5);
   const [mnemonic, setMnemonic] = useState("");
   const [wallets, setWallets] = useState<GeneratedWallet[]>([]);
-  const [status, setStatus] = useState<{ text: string; tone: "info" | "success" | "error" | "warning" } | null>(null);
+  const [status, setStatus] = useState<StatusMsg | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [simMode, setSimMode] = useState<"empirical" | "live">("empirical");
+  const [simMode, setSimMode] = useState<SimMode>("empirical");
   const [ownerBuyEth, setOwnerBuyEth] = useState(0.45);
   const [liquidityL, setLiquidityL] = useState(DEFAULT_LIQUIDITY_ESTIMATE);
   const [plan, setPlan] = useState<PlanStep[] | null>(null);
   const [poolAddress, setPoolAddress] = useState<string | null>(null);
-  const [empiricalStats, setEmpiricalStats] = useState<{
-    floorMcUsd: number; afterOwnerBuyMcUsd: number; pctOfSupplyOwnerBought: number;
-    ethReserveAfterOwnerBuy: number; tokenReserveAfterOwnerBuy: number;
-  } | null>(null);
+  const [empiricalStats, setEmpiricalStats] = useState<EmpiricalStats | null>(null);
+
+  // Manual common buy amount applied to every wallet (Step 3).
+  const [commonBuyEth, setCommonBuyEth] = useState(0.02);
 
   const [signerProvider, setSignerProvider] = useState<BrowserProvider | null>(null);
   const [buyResults, setBuyResults] = useState<WalletEntry[]>([]);
   const [sellConfig, setSellConfig] = useState<Record<string, WalletSellConfig>>({});
   const watcherRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const setStatusMsg = (text: string, tone: "info" | "success" | "error" | "warning" = "info") => setStatus({ text, tone });
+  const setStatusMsg = (text: string, tone: StatusTone = "info") => setStatus({ text, tone });
 
   // ---- Section 1: wallets ----
   const handleGenerate = () => {
@@ -120,9 +120,24 @@ export default function LaunchPage() {
     }
   };
 
+  // ---- Section 3: apply a single common amount to every wallet ----
+  const handleApplyCommon = () => {
+    if (wallets.length === 0) return setStatusMsg("Generate or load wallets first.", "warning");
+    if (!(commonBuyEth > 0)) return setStatusMsg("Enter a buy amount greater than 0.", "warning");
+    const flatPlan: PlanStep[] = wallets.map((_, i) => ({
+      walletIndex: i,
+      ethGrossToSend: commonBuyEth,
+      mcAfterUsd: 0, // manual amount — market cap not modelled
+    }));
+    setPlan(flatPlan);
+    setEmpiricalStats(null);
+    const total = commonBuyEth * wallets.length;
+    setStatusMsg(`Applied ${commonBuyEth} ETH to all ${wallets.length} wallet(s) — total ${total.toFixed(4)} ETH. Fund & buy now use this flat amount.`, "success");
+  };
+
   // ---- Section 3: fund + buy ----
   const handleFund = async () => {
-    if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation first.", "warning");
+    if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation or apply a common amount first.", "warning");
     if (!signerProvider) return setStatusMsg("Connect MetaMask first.", "warning");
     setStatusMsg("Funding wallets...", "info");
     const signer = await signerProvider.getSigner();
@@ -133,7 +148,7 @@ export default function LaunchPage() {
   };
 
   const handleBuy = async () => {
-    if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation first.", "warning");
+    if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation or apply a common amount first.", "warning");
     if (!tokenAddress) return setStatusMsg("Token address is required to execute buys.", "warning");
     if (!signerProvider) return setStatusMsg("Connect MetaMask first — it may be needed to cover shortfalls.", "warning");
 
@@ -189,6 +204,9 @@ export default function LaunchPage() {
   };
 
   // ---- Section 4: sell per wallet ----
+  const handleSellConfigChange = (address: string, cfg: WalletSellConfig) =>
+    setSellConfig((p) => ({ ...p, [address]: cfg }));
+
   const handleSellWallet = useCallback(async (address: string, privateKey: string) => {
     const cfg = sellConfig[address];
     if (!cfg) return;
@@ -244,197 +262,51 @@ export default function LaunchPage() {
       <div className="w-full max-w-7xl mx-auto px-6 sm:px-12 py-12 space-y-12">
         {status && <Banner tone={status.tone}>{status.text}</Banner>}
 
-        {/* 1. WALLETS */}
-        <div className="mb-20"><StepCard step={1} title="Wallets" description="Generate a fresh wallet set, or load one you saved earlier from CSV">
-          <div className="grid grid-cols-1 sm:grid-cols-[160px_1fr] gap-6 items-end">
-            <Field label="Wallet count">
-              <Input type="number" value={walletCount} onChange={(e) => setWalletCount(Number(e.target.value))} className="w-full" />
-            </Field>
-            <div className="flex gap-4 flex-wrap">
-              <Button variant="primary" onClick={handleGenerate}><WalletIcon className="h-5 w-5" /> Generate</Button>
-              <Button variant="secondary" onClick={handleSaveCsv}><Download className="h-5 w-5" /> Save (CSV)</Button>
-              <Button variant="secondary" onClick={handleLoadClick}><Upload className="h-5 w-5" /> Load (CSV)</Button>
-              <input ref={fileInputRef} type="file" accept=".csv,text/csv" onChange={handleFileSelected} className="hidden" />
-            </div>
-          </div>
+        <WalletsSection
+          walletCount={walletCount}
+          onWalletCountChange={setWalletCount}
+          mnemonic={mnemonic}
+          wallets={wallets}
+          fileInputRef={fileInputRef}
+          onGenerate={handleGenerate}
+          onSaveCsv={handleSaveCsv}
+          onLoadClick={handleLoadClick}
+          onFileSelected={handleFileSelected}
+        />
 
-          {mnemonic && (
-            <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-6 flex items-start sm:items-center justify-between gap-4 flex-wrap">
-              <div className="flex items-center gap-3">
-                <ShieldAlert className="h-5 w-5 text-red-300 shrink-0" />
-                <span className="text-base text-red-300 font-medium">Master seed phrase — back this up, never share it</span>
-              </div>
-              <SecretField value={mnemonic} />
-            </div>
-          )}
+        <SimulateSection
+          simMode={simMode}
+          onSimModeChange={setSimMode}
+          ownerBuyEth={ownerBuyEth}
+          onOwnerBuyEthChange={setOwnerBuyEth}
+          liquidityL={liquidityL}
+          onLiquidityLChange={setLiquidityL}
+          tokenAddress={tokenAddress}
+          onTokenAddressChange={setTokenAddress}
+          onSimulateEmpirical={handleSimulateEmpirical}
+          onSimulateLive={handleSimulateLive}
+          empiricalStats={empiricalStats}
+          plan={plan}
+          wallets={wallets}
+        />
 
-          {wallets.length > 0 && (
-            <div className="overflow-x-auto rounded-2xl border border-white/10">
-              <table className="w-full text-base">
-                <thead>
-                  <tr className="text-left text-sm uppercase tracking-wider text-zinc-500 bg-white/[0.04]">
-                    <th className="py-4 px-5 font-medium">#</th>
-                    <th className="py-4 px-5 font-medium">Address</th>
-                    <th className="py-4 px-5 font-medium">Private Key</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {wallets.map((w) => (
-                    <tr key={w.index} className="hover:bg-white/[0.03] transition">
-                      <td className="py-4 px-5 text-zinc-500 font-mono">{w.index}</td>
-                      <td className="py-4 px-5"><AddressChip address={w.address} /></td>
-                      <td className="py-4 px-5"><SecretField value={w.privateKey} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+        <FundBuySection
+          tokenAddress={tokenAddress}
+          onTokenAddressChange={setTokenAddress}
+          commonBuyEth={commonBuyEth}
+          onCommonBuyEthChange={setCommonBuyEth}
+          onApplyCommon={handleApplyCommon}
+          walletCount={wallets.length}
+          onFund={handleFund}
+          onBuy={handleBuy}
+        />
 
-          <p className="text-sm text-zinc-500 leading-relaxed">
-            The exported CSV contains plain-text private keys and the master seed phrase. Treat it like cash: move it to
-            a password manager or offline storage immediately, then delete the file.
-          </p>
-        </StepCard></div>
-
-        {/* 2. SIMULATE */}
-        <div className="mb-20"><StepCard
-          step={2}
-          title="Simulate"
-          description="Model market cap and per-wallet buy sizes before spending anything"
-          actions={
-            <div className="inline-flex rounded-xl border border-white/10 bg-white/5 p-1.5">
-              <button
-                onClick={() => setSimMode("empirical")}
-                className={`px-5 py-2.5 rounded-lg text-sm font-medium transition ${simMode === "empirical" ? "bg-brand text-black" : "text-zinc-400 hover:text-brand-goldLight"}`}
-              >
-                Empirical
-              </button>
-              <button
-                onClick={() => setSimMode("live")}
-                className={`px-5 py-2.5 rounded-lg text-sm font-medium transition ${simMode === "live" ? "bg-brand text-black" : "text-zinc-400 hover:text-brand-goldLight"}`}
-              >
-                Live (on-chain)
-              </button>
-            </div>
-          }
-        >
-          {simMode === "empirical" ? (
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-end">
-              <Field label="Owner's first buy (ETH)">
-                <Input type="number" step="0.01" value={ownerBuyEth} onChange={(e) => setOwnerBuyEth(Number(e.target.value))} className="w-full" />
-              </Field>
-              <Field label="Liquidity estimate (L)">
-                <Input type="number" value={liquidityL} onChange={(e) => setLiquidityL(Number(e.target.value))} className="w-full" />
-              </Field>
-              <Button variant="primary" onClick={handleSimulateEmpirical} className="h-14"><LineChart className="h-5 w-5" /> Simulate</Button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-6 items-end">
-              <Field label="Token address">
-                <Input placeholder="0x…" value={tokenAddress} onChange={(e) => setTokenAddress(e.target.value)} className="w-full font-mono" />
-              </Field>
-              <Button variant="primary" onClick={handleSimulateLive}><LineChart className="h-5 w-5" /> Simulate</Button>
-            </div>
-          )}
-
-          {empiricalStats && (
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-5">
-              <StatBox label="Floor MC (pre-buy)" value={`$${empiricalStats.floorMcUsd.toFixed(0)}`} />
-              <StatBox label="MC after owner buy" value={`$${empiricalStats.afterOwnerBuyMcUsd.toFixed(0)}`} tone="brand" />
-              <StatBox label="Owner bought" value={`${empiricalStats.pctOfSupplyOwnerBought.toFixed(2)}%`} sub="of supply" />
-              <StatBox
-                label="Reserves (ETH / tok)"
-                value={`${empiricalStats.ethReserveAfterOwnerBuy.toFixed(2)} / ${empiricalStats.tokenReserveAfterOwnerBuy.toFixed(0)}`}
-              />
-            </div>
-          )}
-
-          {plan && (
-            <div className="overflow-x-auto rounded-2xl border border-white/10">
-              <table className="w-full text-base">
-                <thead>
-                  <tr className="text-left text-sm uppercase tracking-wider text-zinc-500 bg-white/[0.04]">
-                    <th className="py-4 px-5 font-medium">Wallet</th>
-                    <th className="py-4 px-5 font-medium">ETH to send</th>
-                    <th className="py-4 px-5 font-medium">MC after buy</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {plan.map((s) => (
-                    <tr key={s.walletIndex} className="hover:bg-white/[0.03] transition">
-                      <td className="py-4 px-5">
-                        {wallets[s.walletIndex]?.address ? <AddressChip address={wallets[s.walletIndex].address} /> : <span className="text-zinc-400">#{s.walletIndex}</span>}
-                      </td>
-                      <td className="py-4 px-5 text-brand-goldLight font-mono">{s.ethGrossToSend.toFixed(5)} ETH</td>
-                      <td className="py-4 px-5 text-zinc-400">${s.mcAfterUsd.toFixed(0)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </StepCard></div>
-
-        {/* 3. FUND & BUY */}
-        <div className="mb-20"><StepCard step={3} title="Fund & Buy" description="Funding source: connected MetaMask wallet">
-          <Field label="Token address (required to buy)">
-            <Input placeholder="0x…" value={tokenAddress} onChange={(e) => setTokenAddress(e.target.value)} className="w-full font-mono" />
-          </Field>
-          <div className="flex gap-4 flex-wrap">
-            <Button variant="secondary" onClick={handleFund}>Fund Wallets (+3% margin)</Button>
-            <Button variant="primary" onClick={handleBuy}><Rocket className="h-5 w-5" /> Execute Buys</Button>
-          </div>
-        </StepCard></div>
-
-        {/* 4. SELL PER WALLET */}
-        <div className="mb-20"><StepCard step={4} title="Sell Per Wallet" description="Auto-sell polls every 5s once current MC ≥ entry MC × threshold">
-          <div className="overflow-x-auto rounded-2xl border border-white/10">
-            <table className="w-full text-base">
-              <thead>
-                <tr className="text-left text-sm uppercase tracking-wider text-zinc-500 bg-white/[0.04]">
-                  <th className="py-4 px-5 font-medium">Wallet</th>
-                  <th className="py-4 px-5 font-medium">Sell %</th>
-                  <th className="py-4 px-5 font-medium">Sell at (x entry)</th>
-                  <th className="py-4 px-5 font-medium">Auto</th>
-                  <th className="py-4 px-5 font-medium"></th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/5">
-                {wallets.map((w) => {
-                  const cfg = sellConfig[w.address] ?? { sellPct: 100, gainThreshold: 2, autoSell: false };
-                  return (
-                    <tr key={w.address} className="hover:bg-white/[0.03] transition">
-                      <td className="py-4 px-5"><AddressChip address={w.address} /></td>
-                      <td className="py-4 px-5">
-                        <Input
-                          compact type="number" value={cfg.sellPct}
-                          onChange={(e) => setSellConfig((p) => ({ ...p, [w.address]: { ...cfg, sellPct: Number(e.target.value) } }))}
-                          className="w-24"
-                        />
-                      </td>
-                      <td className="py-4 px-5">
-                        <Input
-                          compact type="number" step="0.1" value={cfg.gainThreshold}
-                          onChange={(e) => setSellConfig((p) => ({ ...p, [w.address]: { ...cfg, gainThreshold: Number(e.target.value) } }))}
-                          className="w-24"
-                        />
-                      </td>
-                      <td className="py-4 px-5">
-                        <Toggle checked={cfg.autoSell} onChange={(v) => setSellConfig((p) => ({ ...p, [w.address]: { ...cfg, autoSell: v } }))} />
-                      </td>
-                      <td className="py-4 px-5">
-                        <Button variant="secondary" onClick={() => handleSellWallet(w.address, w.privateKey)}>
-                          <Target className="h-4 w-4" /> Sell Now
-                        </Button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </StepCard></div>
+        <SellSection
+          wallets={wallets}
+          sellConfig={sellConfig}
+          onSellConfigChange={handleSellConfigChange}
+          onSellWallet={handleSellWallet}
+        />
       </div>
     </div>
   );
