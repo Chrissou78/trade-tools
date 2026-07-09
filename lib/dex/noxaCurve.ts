@@ -110,9 +110,14 @@ export function simulateBuyExact(
   return { tokensOut, newSqrtP };
 }
 
-export function sqrtPToMarketCapUsd(sqrtP: number, totalSupply: number, ethPriceUsd: number): number {
-  const priceRaw = sqrtP * sqrtP;          // tokens per WETH
-  const tokenPriceInWeth = 1 / priceRaw;
+export function sqrtPToMarketCapUsd(
+  sqrtP: number,
+  totalSupply: number,
+  ethPriceUsd: number,
+  wethIsToken0: boolean = true // confirmed true in both real NOXA launches inspected — verify per-token in live mode
+): number {
+  const priceRaw = sqrtP * sqrtP; // token1 per token0
+  const tokenPriceInWeth = wethIsToken0 ? 1 / priceRaw : priceRaw;
   return tokenPriceInWeth * totalSupply * ethPriceUsd;
 }
 
@@ -132,7 +137,8 @@ export function planSequentialBuys(
   startingSqrtP: number,
   curve: CurveCalibration,
   totalSupply: number,
-  ethPriceUsd: number
+  ethPriceUsd: number,
+  wethIsToken0: boolean = true
 ): WalletBuyStep[] {
   let sqrtP = startingSqrtP;
   let cumulative = 0;
@@ -148,7 +154,7 @@ export function planSequentialBuys(
       targetTokens: targetTokensPerWallet,
       ethGrossToSend: ethGrossIn,
       cumulativeEth: cumulative,
-      mcAfterUsd: sqrtPToMarketCapUsd(sqrtP, totalSupply, ethPriceUsd),
+      mcAfterUsd: sqrtPToMarketCapUsd(sqrtP, totalSupply, ethPriceUsd, wethIsToken0),
     });
   }
 
