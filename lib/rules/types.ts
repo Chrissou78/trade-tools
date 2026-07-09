@@ -28,3 +28,16 @@ export interface Position {
   sellTriggers: SellTrigger[];
   peakMcUsd: number; // for trailing-stop tracking
 }
+
+export interface SellStrategy {
+  triggers: SellTrigger[];
+}
+
+export const DEFAULT_SELL_STRATEGY: SellStrategy = {
+  triggers: [
+    { id: "tp1", type: "take_profit_mc_multiple", value: 2, exitPercentage: 50 },
+    { id: "tp2", type: "take_profit_mc_multiple", value: 5, exitPercentage: 100 },
+    { id: "sl", type: "stop_loss_mc_drop_pct", value: 40, exitPercentage: 100 },
+    { id: "trail", type: "trailing_stop_pct", value: 25, exitPercentage: 100 },
+  ],
+};
