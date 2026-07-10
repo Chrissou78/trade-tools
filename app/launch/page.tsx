@@ -1,14 +1,18 @@
 // app/launch/page.tsx
 "use client";
 import { useState, useCallback, useEffect, useRef } from "react";
-import { BrowserProvider, JsonRpcProvider, Wallet, parseEther } from "ethers";
+import { BrowserProvider, JsonRpcProvider, Wallet, Contract, parseEther, formatEther, isAddress } from "ethers";
 import { generateWalletSet, GeneratedWallet } from "@/lib/wallets/generator";
 import { downloadWalletsCsv, parseWalletsCsv } from "@/lib/wallets/csv";
 import { findPoolAndState } from "@/lib/dex/pool";
 import { planMultiWalletBuy } from "@/lib/dex/planMultiBuy";
 import { simulateFromOwnerBuy, DEFAULT_LIQUIDITY_ESTIMATE } from "@/lib/dex/empiricalSim";
-import { distributeVariableEth } from "@/lib/batch/sender";
+import { distributeVariableEth, distributeEth } from "@/lib/batch/sender";
+import type { SendResult } from "@/lib/batch/sender";
 import { multiBuyVariable } from "@/lib/batch/buyer";
+import { prepareWallets, fireSwaps, runPool } from "@/lib/batch/prepareBuy";
+import type { PrepareResult, SwapResult } from "@/lib/batch/prepareBuy";
+import { ADDRESSES } from "@/lib/chains/robinhood";
 import { sellNoxaToken } from "@/lib/dex/sell";
 import { getLiveSqrtPrice, sqrtPToMarketCapUsd } from "@/lib/dex/noxaCurve";
 import { useEthPrice } from "@/hooks/useEthPrice";
@@ -18,10 +22,40 @@ import { PageHeader, Banner } from "@/components/ui";
 import { WalletsSection } from "./sections/WalletsSection";
 import { SimulateSection } from "./sections/SimulateSection";
 import { FundBuySection } from "./sections/FundBuySection";
+import { ManualBatchSection } from "./sections/ManualBatchSection";
 import { SellSection } from "./sections/SellSection";
 import type {
-  StatusMsg, StatusTone, PlanStep, WalletSellConfig, WalletEntry, EmpiricalStats, SimMode,
+  StatusMsg, StatusTone, PlanStep, WalletSellConfig, WalletEntry, EmpiricalStats, SimMode, ManualBuyRow,
 } from "./types";
+
+// Split "0xabc, 0xdef\n0x123" into a clean address list, keeping only valid ones.
+function parseAddressList(raw: string): { valid: string[]; invalid: number } {
+  const tokens = raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  const valid = tokens.filter((a) => isAddress(a));
+  return { valid, invalid: tokens.length - valid.length };
+}
+
+// A manual buy wraps ETH into WETH and swaps it. Gas for the wrap, approve and
+// swap is paid from the wallet's ETH, separate from the amount being swapped.
+// So "max buy" is the balance minus a gas reserve, estimated from live gas with
+// a floor so a zero/low fee reading never drains the wallet dry.
+const GAS_UNITS_FOR_BUY = 320_000n; // wrap + approve + swap, with headroom
+const MIN_GAS_RESERVE_WEI = parseEther("0.0003");
+const WETH_BALANCE_ABI = ["function balanceOf(address) view returns (uint256)"];
+
+async function readWalletState(provider: JsonRpcProvider, address: string) {
+  const weth = new Contract(ADDRESSES.weth, WETH_BALANCE_ABI, provider);
+  const [balanceWei, wethWei, feeData] = await Promise.all([
+    provider.getBalance(address),
+    weth.balanceOf(address) as Promise<bigint>,
+    provider.getFeeData(),
+  ]);
+  const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
+  let reserveWei = gasPrice * GAS_UNITS_FOR_BUY;
+  if (reserveWei < MIN_GAS_RESERVE_WEI) reserveWei = MIN_GAS_RESERVE_WEI;
+  const maxWei = balanceWei > reserveWei ? balanceWei - reserveWei : 0n;
+  return { balanceWei, wethWei, reserveWei, maxWei };
+}
 
 const HTTP_RPC = process.env.NEXT_PUBLIC_ROBINHOOD_HTTP_RPC!;
 
@@ -44,12 +78,35 @@ export default function LaunchPage() {
   // Manual common buy amount applied to every wallet (Step 3).
   const [commonBuyEth, setCommonBuyEth] = useState(0.02);
 
+  // Manual load & buy — independent of the generated set (Step 4).
+  const [fundList, setFundList] = useState("");
+  const [fundAmountEth, setFundAmountEth] = useState(0.02);
+  const [fundResults, setFundResults] = useState<SendResult[]>([]);
+  const [manualBuyRows, setManualBuyRows] = useState<ManualBuyRow[]>([]);
+  const [prepareResults, setPrepareResults] = useState<PrepareResult[]>([]);
+  const [manualBuyResults, setManualBuyResults] = useState<SwapResult[]>([]);
+  const [fireConcurrency, setFireConcurrency] = useState(2);
+  const [slippagePct, setSlippagePct] = useState(50);
+
   const [signerProvider, setSignerProvider] = useState<BrowserProvider | null>(null);
   const [buyResults, setBuyResults] = useState<WalletEntry[]>([]);
   const [sellConfig, setSellConfig] = useState<Record<string, WalletSellConfig>>({});
   const watcherRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const setStatusMsg = (text: string, tone: StatusTone = "info") => setStatus({ text, tone });
+
+  // Trim and validate the token address before it reaches any contract call.
+  // A stray space/newline makes ethers try ENS, which this chain lacks, giving
+  // a confusing "network does not support ENS" error. Returns null (and warns)
+  // when the value is not a clean address.
+  const resolveToken = (): string | null => {
+    const t = tokenAddress.trim();
+    if (!isAddress(t)) {
+      setStatusMsg("Enter a valid token address — 0x followed by 40 hex characters, no spaces.", "warning");
+      return null;
+    }
+    return t;
+  };
 
   // ---- Section 1: wallets ----
   const handleGenerate = () => {
@@ -104,14 +161,15 @@ export default function LaunchPage() {
   };
 
   const handleSimulateLive = async () => {
-    if (!tokenAddress) return setStatusMsg("Enter a token address for live simulation.", "warning");
+    const token = resolveToken();
+    if (!token) return;
     if (!ethPriceUsd) return setStatusMsg("Waiting on ETH price feed...", "warning");
     setStatusMsg("Reading pool state on-chain...", "info");
     try {
       const provider = new JsonRpcProvider(HTTP_RPC);
-      const poolState = await findPoolAndState(provider, tokenAddress);
+      const poolState = await findPoolAndState(provider, token);
       setPoolAddress(poolState.poolAddress);
-      const result = await planMultiWalletBuy(provider, tokenAddress, poolState.poolAddress, wallets.length || walletCount, 0.96, ethPriceUsd);
+      const result = await planMultiWalletBuy(provider, token, poolState.poolAddress, wallets.length || walletCount, 0.96, ethPriceUsd);
       setPlan(result.map((s: any) => ({ walletIndex: s.walletIndex, ethGrossToSend: s.ethGrossToSend, mcAfterUsd: s.mcAfterUsd })));
       setEmpiricalStats(null);
       setStatusMsg(`Live simulation ready — total ${result.reduce((s: number, r: any) => s + r.ethGrossToSend, 0).toFixed(4)} ETH.`, "success");
@@ -135,6 +193,187 @@ export default function LaunchPage() {
     setStatusMsg(`Applied ${commonBuyEth} ETH to all ${wallets.length} wallet(s) — total ${total.toFixed(4)} ETH. Fund & buy now use this flat amount.`, "success");
   };
 
+  // ---- Section 4: manual load & buy (independent of the generated set) ----
+  const handleSendEthList = async () => {
+    if (!signerProvider) return setStatusMsg("Connect MetaMask first.", "warning");
+    const { valid, invalid } = parseAddressList(fundList);
+    if (valid.length === 0) return setStatusMsg("Paste at least one valid wallet address.", "warning");
+    if (!(fundAmountEth > 0)) return setStatusMsg("Enter an amount greater than 0.", "warning");
+    setFundResults([]);
+    setStatusMsg(
+      `Sending ${fundAmountEth} ETH to ${valid.length} wallet(s)${invalid > 0 ? ` (skipping ${invalid} invalid line(s))` : ""}...`,
+      "info"
+    );
+    try {
+      const signer = await signerProvider.getSigner();
+      const results = await distributeEth(signer, valid, fundAmountEth.toString());
+      setFundResults(results);
+      const failed = results.filter((r) => r.status === "failed").length;
+      setStatusMsg(
+        failed > 0 ? `Sent with ${failed} failure(s).` : `Sent ${fundAmountEth} ETH to all ${valid.length} wallet(s).`,
+        failed > 0 ? "warning" : "success"
+      );
+    } catch (err: any) {
+      setStatusMsg(`Send failed: ${err.message}`, "error");
+    }
+  };
+
+  const handleAddBuyRow = async (privateKey: string): Promise<boolean> => {
+    try {
+      const provider = new JsonRpcProvider(HTTP_RPC);
+      const wallet = new Wallet(privateKey, provider);
+      if (manualBuyRows.some((r) => r.address === wallet.address)) {
+        setStatusMsg("That wallet is already in the list.", "warning");
+        return false;
+      }
+      setStatusMsg(`Reading balance for ${wallet.address.slice(0, 6)}...`, "info");
+      const { balanceWei, wethWei, maxWei } = await readWalletState(provider, wallet.address);
+      setManualBuyRows((prev) => [
+        ...prev,
+        {
+          privateKey: wallet.privateKey,
+          address: wallet.address,
+          balanceEth: formatEther(balanceWei),
+          wethEth: formatEther(wethWei),
+          maxBuyEth: formatEther(maxWei),
+        },
+      ]);
+      setStatusMsg(`Added ${wallet.address.slice(0, 6)}… — balance ${Number(formatEther(balanceWei)).toFixed(5)} ETH.`, "success");
+      return true;
+    } catch (err: any) {
+      setStatusMsg(`Could not add wallet: ${err.message}`, "error");
+      return false;
+    }
+  };
+
+  const handleRemoveBuyRow = (index: number) =>
+    setManualBuyRows((prev) => prev.filter((_, i) => i !== index));
+
+  // Bulk load: paste many private keys at once (one per line, or comma/space
+  // separated). Invalid keys and duplicates are skipped; balances are read
+  // through the pool so a big paste doesn't flood the RPC.
+  const handleLoadKeys = async (raw: string): Promise<number> => {
+    const tokens = raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    if (tokens.length === 0) {
+      setStatusMsg("Paste at least one private key.", "warning");
+      return 0;
+    }
+    const existing = new Set(manualBuyRows.map((r) => r.address));
+    const seen = new Set<string>();
+    const valid: { privateKey: string; address: string }[] = [];
+    let invalid = 0;
+    for (const tok of tokens) {
+      try {
+        const w = new Wallet(tok);
+        if (existing.has(w.address) || seen.has(w.address)) continue;
+        seen.add(w.address);
+        valid.push({ privateKey: w.privateKey, address: w.address });
+      } catch {
+        invalid += 1;
+      }
+    }
+    if (valid.length === 0) {
+      setStatusMsg(invalid > 0 ? `No new wallets added — ${invalid} key(s) invalid or already loaded.` : "No new wallets to add.", "warning");
+      return 0;
+    }
+
+    setStatusMsg(`Reading balances for ${valid.length} wallet(s)...`, "info");
+    const provider = new JsonRpcProvider(HTTP_RPC);
+    const rows = await runPool(valid, 4, async (v) => {
+      try {
+        const { balanceWei, wethWei, maxWei } = await readWalletState(provider, v.address);
+        return { privateKey: v.privateKey, address: v.address, balanceEth: formatEther(balanceWei), wethEth: formatEther(wethWei), maxBuyEth: formatEther(maxWei) };
+      } catch {
+        return { privateKey: v.privateKey, address: v.address, balanceEth: "0", wethEth: "0", maxBuyEth: "0" };
+      }
+    });
+    setManualBuyRows((prev) => [...prev, ...rows]);
+    setStatusMsg(`Loaded ${rows.length} wallet(s)${invalid > 0 ? `, skipped ${invalid} invalid or duplicate` : ""}.`, "success");
+    return rows.length;
+  };
+
+  const handleRefreshBalances = async () => {
+    if (manualBuyRows.length === 0) return;
+    setStatusMsg("Refreshing balances...", "info");
+    const provider = new JsonRpcProvider(HTTP_RPC);
+    const updated = await runPool(manualBuyRows, 4, async (row) => {
+      try {
+        const { balanceWei, wethWei, maxWei } = await readWalletState(provider, row.address);
+        return { ...row, balanceEth: formatEther(balanceWei), wethEth: formatEther(wethWei), maxBuyEth: formatEther(maxWei) };
+      } catch {
+        return row;
+      }
+    });
+    setManualBuyRows(updated);
+    setStatusMsg("Balances refreshed.", "success");
+  };
+
+  // Phase 1: wrap + approve ahead of launch, so the launch click is swap-only.
+  const handlePrepareWallets = async () => {
+    if (manualBuyRows.length === 0) return setStatusMsg("Add at least one wallet first.", "warning");
+    const provider = new JsonRpcProvider(HTTP_RPC);
+    setStatusMsg("Reading balances before wrapping...", "info");
+
+    const items: { wallet: Wallet; amountWei: bigint }[] = [];
+    const skipped: string[] = [];
+    for (const row of manualBuyRows) {
+      try {
+        const wallet = new Wallet(row.privateKey, provider);
+        const { maxWei } = await readWalletState(provider, wallet.address);
+        if (maxWei <= 0n) { skipped.push(row.address); continue; }
+        items.push({ wallet, amountWei: maxWei });
+      } catch {
+        skipped.push(row.address);
+      }
+    }
+
+    if (items.length === 0) return setStatusMsg("No wallets have enough balance to wrap after the gas reserve.", "error");
+    setPrepareResults([]);
+    setStatusMsg(
+      skipped.length > 0
+        ? `Wrapping + approving ${items.length} wallet(s), skipping ${skipped.length} too low...`
+        : `Wrapping + approving ${items.length} wallet(s)...`,
+      skipped.length > 0 ? "warning" : "info"
+    );
+
+    try {
+      const results = await prepareWallets(items, fireConcurrency);
+      setPrepareResults(results);
+      const failed = results.filter((r) => r.status === "failed").length;
+      setStatusMsg(
+        failed > 0 ? `Prepared with ${failed} failure(s).` : `Prepared ${items.length} wallet(s). Ready to fire.`,
+        failed > 0 ? "warning" : "success"
+      );
+      await handleRefreshBalances();
+    } catch (err: any) {
+      setStatusMsg(`Prepare failed: ${err.message}`, "error");
+    }
+  };
+
+  // Phase 2: fire one swap per wallet, all at once, from each wallet's WETH.
+  const handleFireBuys = async () => {
+    const token = resolveToken();
+    if (!token) return;
+    if (manualBuyRows.length === 0) return setStatusMsg("Add at least one wallet first.", "warning");
+    setManualBuyResults([]);
+    setStatusMsg(`Firing ${manualBuyRows.length} swap(s)...`, "info");
+    try {
+      const provider = new JsonRpcProvider(HTTP_RPC);
+      const wallets = manualBuyRows.map((r) => new Wallet(r.privateKey, provider));
+      const slippageBps = Math.round(slippagePct * 100);
+      const results = await fireSwaps(wallets, token, slippageBps, 10000, fireConcurrency);
+      setManualBuyResults(results);
+      const failed = results.filter((r) => r.status === "failed").length;
+      setStatusMsg(
+        failed > 0 ? `Buys fired with ${failed} failure(s).` : `Buys fired for ${wallets.length} wallet(s).`,
+        failed > 0 ? "warning" : "success"
+      );
+      await handleRefreshBalances();
+    } catch (err: any) {
+      setStatusMsg(`Fire failed: ${err.message}`, "error");
+    }
+  };
+
   // ---- Section 3: fund + buy ----
   const handleFund = async () => {
     if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation or apply a common amount first.", "warning");
@@ -149,7 +388,8 @@ export default function LaunchPage() {
 
   const handleBuy = async () => {
     if (!plan || wallets.length === 0) return setStatusMsg("Run a simulation or apply a common amount first.", "warning");
-    if (!tokenAddress) return setStatusMsg("Token address is required to execute buys.", "warning");
+    const token = resolveToken();
+    if (!token) return;
     if (!signerProvider) return setStatusMsg("Connect MetaMask first — it may be needed to cover shortfalls.", "warning");
 
     setStatusMsg("Checking wallet balances before buying...", "info");
@@ -181,7 +421,7 @@ export default function LaunchPage() {
       return;
     }
 
-    const results = await multiBuyVariable(items, tokenAddress, 500, [300, 1500]);
+    const results = await multiBuyVariable(items, token, 500, [300, 1500]);
 
     const withEntry: WalletEntry[] = [];
     for (const r of results) {
@@ -210,11 +450,13 @@ export default function LaunchPage() {
   const handleSellWallet = useCallback(async (address: string, privateKey: string) => {
     const cfg = sellConfig[address];
     if (!cfg) return;
+    const token = tokenAddress.trim();
+    if (!isAddress(token)) return setStatusMsg("Set a valid token address before selling.", "warning");
     setStatusMsg(`Selling ${cfg.sellPct}% from ${address.slice(0, 8)}...`, "info");
     try {
       const provider = new JsonRpcProvider(HTTP_RPC);
       const wallet = new Wallet(privateKey, provider);
-      const outcome = await sellNoxaToken({ wallet, tokenAddress, sellPercentage: cfg.sellPct });
+      const outcome = await sellNoxaToken({ wallet, tokenAddress: token, sellPercentage: cfg.sellPct });
       setStatusMsg(
         outcome.status === "success"
           ? `Sold ${cfg.sellPct}% from ${address.slice(0, 8)}...`
@@ -299,6 +541,30 @@ export default function LaunchPage() {
           walletCount={wallets.length}
           onFund={handleFund}
           onBuy={handleBuy}
+        />
+
+        <ManualBatchSection
+          tokenAddress={tokenAddress}
+          onTokenAddressChange={setTokenAddress}
+          fundList={fundList}
+          onFundListChange={setFundList}
+          fundAmountEth={fundAmountEth}
+          onFundAmountChange={setFundAmountEth}
+          onSendEthList={handleSendEthList}
+          fundResults={fundResults}
+          manualBuyRows={manualBuyRows}
+          onAddBuyRow={handleAddBuyRow}
+          onLoadKeys={handleLoadKeys}
+          onRemoveBuyRow={handleRemoveBuyRow}
+          onRefreshBalances={handleRefreshBalances}
+          onPrepareWallets={handlePrepareWallets}
+          onFireBuys={handleFireBuys}
+          concurrency={fireConcurrency}
+          onConcurrencyChange={setFireConcurrency}
+          slippagePct={slippagePct}
+          onSlippageChange={setSlippagePct}
+          prepareResults={prepareResults}
+          manualBuyResults={manualBuyResults}
         />
 
         <SellSection

@@ -16,7 +16,7 @@ const DEFAULT_CFG: WalletSellConfig = { sellPct: 100, gainThreshold: 2, autoSell
 
 export function SellSection({ wallets, sellConfig, onSellConfigChange, onSellWallet }: Props) {
   return (
-    <div className="mb-20"><StepCard step={4} title="Sell Per Wallet" description="Auto-sell polls every 5s once current MC ≥ entry MC × threshold">
+    <div className="mb-20"><StepCard step={5} title="Sell Per Wallet" description="Auto-sell polls every 5s once current MC ≥ entry MC × threshold">
       <div className="overflow-x-auto rounded-2xl border border-white/10">
         <table className="w-full text-base">
           <thead>

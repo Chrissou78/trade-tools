@@ -37,3 +37,14 @@ export interface EmpiricalStats {
 }
 
 export type SimMode = "empirical" | "live";
+
+// One manually-added buy wallet. Wallets are wrapped ahead of launch, then the
+// swap fires from the WETH balance. We store the address plus last-read native
+// balance, wrapped (WETH) balance, and computed max for display.
+export interface ManualBuyRow {
+  privateKey: string;
+  address: string;
+  balanceEth: string;
+  wethEth: string;
+  maxBuyEth: string;
+}
